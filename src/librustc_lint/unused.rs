@@ -1,7 +1,9 @@
 use rustc::hir::def::{Res, DefKind};
 use rustc::hir::def_id::DefId;
+use rustc::hir::HirVec;
 use rustc::lint;
 use rustc::ty::{self, Ty};
+use rustc::ty::subst::Subst;
 use rustc::ty::adjustment;
 use rustc_data_structures::fx::FxHashMap;
 use lint::{LateContext, EarlyContext, LintContext, LintArray};
@@ -48,7 +50,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
         }
 
         let ty = cx.tables.expr_ty(&expr);
-        let type_permits_lack_of_use = check_must_use_ty(cx, ty, &expr, s.span, "", "", 1);
+        let type_permits_lack_of_use = check_must_use_ty(cx, ty, &expr, s.span, "", "", 1, false);
 
         let mut fn_warned = false;
         let mut op_warned = false;
@@ -73,7 +75,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
             _ => None
         };
         if let Some(def_id) = maybe_def_id {
-            fn_warned = check_must_use_def(cx, def_id, s.span, "return value of ", "");
+            fn_warned = check_must_use_def(cx, def_id, s.span, "return value of ", "", false);
         } else if type_permits_lack_of_use {
             // We don't warn about unused unit or uninhabited types.
             // (See https://github.com/rust-lang/rust/issues/43806 for details.)
@@ -135,24 +137,61 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
             span: Span,
             descr_pre: &str,
             descr_post: &str,
-            plural_len: usize,
+            len: usize,
+            err: bool, // HACK: Report an error rather than a lint, for crater testing.
         ) -> bool {
-            if ty.is_unit() || cx.tcx.is_ty_uninhabited_from(
-                cx.tcx.hir().get_module_parent(expr.hir_id), ty)
-            {
+            let module = cx.tcx.hir().get_module_parent(expr.hir_id);
+
+            if ty.is_unit() || cx.tcx.is_ty_uninhabited_from(module, ty) {
                 return true;
             }
 
-            let plural_suffix = pluralise!(plural_len);
+            let plural_suffix = pluralise!(len);
 
             match ty.kind {
                 ty::Adt(..) if ty.is_box() => {
                     let boxed_ty = ty.boxed_ty();
                     let descr_pre = &format!("{}boxed ", descr_pre);
-                    check_must_use_ty(cx, boxed_ty, expr, span, descr_pre, descr_post, plural_len)
+                    check_must_use_ty(cx, boxed_ty, expr, span, descr_pre, descr_post, len, err)
                 }
-                ty::Adt(def, _) => {
-                    check_must_use_def(cx, def.did, span, descr_pre, descr_post)
+                ty::Adt(def, subst) => {
+                    // Check the type itself for `#[must_use]` annotations.
+                    let mut has_emitted = check_must_use_def(
+                        cx, def.did, span, descr_pre, descr_post, err);
+                    // Check any fields of the type for `#[must_use]` annotations.
+                    // We ignore ADTs with more than one variant for simplicity and to avoid
+                    // false positives.
+                    // Unions are also ignored (though in theory, we could lint if every field of
+                    // a union was `#[must_use]`).
+                    if def.variants.len() == 1 && !def.is_union() {
+                        let fields = match &expr.kind {
+                            hir::ExprKind::Struct(_, fields, _) => {
+                                fields.iter().map(|f| &*f.expr).collect()
+                            }
+                            hir::ExprKind::Call(_, args) => args.iter().collect(),
+                            _ => HirVec::new(),
+                        };
+
+                        for variant in &def.variants {
+                            for (i, field) in variant.fields.iter().enumerate() {
+                                let is_visible = def.is_enum() ||
+                                    field.vis.is_accessible_from(module, cx.tcx);
+                                if is_visible {
+                                    let descr_post
+                                        = &format!(" in field `{}`", field.ident.as_str());
+                                    let ty = cx.tcx.type_of(field.did).subst(cx.tcx, subst);
+                                    let (expr, span) = if let Some(&field) = fields.get(i) {
+                                        (field, field.span)
+                                    } else {
+                                        (expr, span)
+                                    };
+                                    has_emitted |= check_must_use_ty(
+                                        cx, ty, expr, span, descr_pre, descr_post, len, true);
+                                }
+                            }
+                        }
+                    }
+                    has_emitted
                 }
                 ty::Opaque(def, _) => {
                     let mut has_emitted = false;
@@ -165,7 +204,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
                                 descr_pre,
                                 plural_suffix,
                             );
-                            if check_must_use_def(cx, def_id, span, descr_pre, descr_post) {
+                            if check_must_use_def(cx, def_id, span, descr_pre, descr_post, err) {
                                 has_emitted = true;
                                 break;
                             }
@@ -183,7 +222,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
                                 plural_suffix,
                                 descr_post,
                             );
-                            if check_must_use_def(cx, def_id, span, descr_pre, descr_post) {
+                            if check_must_use_def(cx, def_id, span, descr_pre, descr_post, err) {
                                 has_emitted = true;
                                 break;
                             }
@@ -202,32 +241,25 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
                     for (i, ty) in tys.iter().map(|k| k.expect_ty()).enumerate() {
                         let descr_post = &format!(" in tuple element {}", i);
                         let span = *spans.get(i).unwrap_or(&span);
-                        if check_must_use_ty(
-                            cx,
-                            ty,
-                            expr,
-                            span,
-                            descr_pre,
-                            descr_post,
-                            plural_len
-                        ) {
-                            has_emitted = true;
-                        }
+                        has_emitted |= check_must_use_ty(
+                            cx, ty, expr, span, descr_pre, descr_post, len, err);
                     }
                     has_emitted
                 }
                 ty::Array(ty, len) => match len.try_eval_usize(cx.tcx, cx.param_env) {
-                    // If the array is definitely non-empty, we can do `#[must_use]` checking.
-                    Some(n) if n != 0 => {
+                    // Empty arrays won't contain any `#[must_use]` types.
+                    Some(0) => false,
+                    // If the array may be non-empty, we do `#[must_use]` checking.
+                    _ => {
                         let descr_pre = &format!(
                             "{}array{} of ",
                             descr_pre,
                             plural_suffix,
                         );
-                        check_must_use_ty(cx, ty, expr, span, descr_pre, descr_post, n as usize + 1)
+                        // `2` is just a stand-in for a number greater than 1, for correct plurals
+                        // in diagnostics.
+                        check_must_use_ty(cx, ty, expr, span, descr_pre, descr_post, 2, err)
                     }
-                    // Otherwise, we don't lint, to avoid false positives.
-                    _ => false,
                 }
                 _ => false,
             }
@@ -240,12 +272,17 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
             span: Span,
             descr_pre_path: &str,
             descr_post_path: &str,
+            force_err: bool, // HACK: Report an error rather than a lint, for crater testing.
         ) -> bool {
             for attr in cx.tcx.get_attrs(def_id).iter() {
                 if attr.check_name(sym::must_use) {
                     let msg = format!("unused {}`{}`{} that must be used",
                         descr_pre_path, cx.tcx.def_path_str(def_id), descr_post_path);
-                    let mut err = cx.struct_span_lint(UNUSED_MUST_USE, span, &msg);
+                    let mut err = if !force_err {
+                        cx.struct_span_lint(UNUSED_MUST_USE, span, &msg)
+                    } else {
+                        cx.sess().struct_span_err(span, &msg)
+                    };
                     // check for #[must_use = "..."]
                     if let Some(note) = attr.value_str() {
                         err.note(&note.as_str());
